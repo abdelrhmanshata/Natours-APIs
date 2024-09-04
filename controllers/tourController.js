@@ -1,8 +1,67 @@
+const multer = require('multer');
+const sharp = require('sharp');
 const Tour = require('./../models/tourModel');
 const catchAsync = require('./../utils/catchAsync');
 const factory = require('./handlerFactory');
 const AppError = require('./../utils/appError');
 
+// Configure multer to store files in memory
+const multerStorage = multer.memoryStorage();
+
+// Filter for image files
+const multerFilter = (req, file, cb) => {
+  if (file.mimetype.startsWith('image')) {
+    cb(null, true);
+  } else {
+    cb(new AppError('Not an image! Please upload only images.', 400), false);
+  }
+};
+
+// Configure multer with memory storage and image filter
+const upload = multer({
+  storage: multerStorage,
+  fileFilter: multerFilter,
+});
+
+// Middleware to handle tour image uploads
+exports.uploadTourImages = upload.fields([
+  { name: 'imageCover', maxCount: 1 },
+  { name: 'images', maxCount: 3 },
+]);
+
+// Middleware to resize and save tour images
+exports.resizeTourImages = catchAsync(async (req, res, next) => {
+  if (!req.files.imageCover || !req.files.images) return next();
+
+  // 1) Resize cover image
+  req.body.imageCover = `tour-${req.params.id}-${Date.now()}-cover.jpeg`;
+  await sharp(req.files.imageCover[0].buffer)
+    .resize(2000, 1333)
+    .toFormat('jpeg')
+    .jpeg({ quality: 90 })
+    .toFile(`public/img/tours/${req.body.imageCover}`);
+
+  // 2) Resize additional images
+  req.body.images = [];
+
+  await Promise.all(
+    req.files.images.map(async (file, i) => {
+      const filename = `tour-${req.params.id}-${Date.now()}-${i + 1}.jpeg`;
+
+      await sharp(file.buffer)
+        .resize(2000, 1333)
+        .toFormat('jpeg')
+        .jpeg({ quality: 90 })
+        .toFile(`public/img/tours/${filename}`);
+
+      req.body.images.push(filename);
+    }),
+  );
+
+  next();
+});
+
+// Middleware to set default query parameters for top tours
 exports.aliasTopTours = (req, res, next) => {
   req.query.limit = '5';
   req.query.sort = '-ratingsAverage,price';
@@ -10,16 +69,18 @@ exports.aliasTopTours = (req, res, next) => {
   next();
 };
 
+// CRUD operations using handlerFactory
 exports.getAllTours = factory.getAll(Tour);
 exports.getTour = factory.getOne(Tour, { path: 'reviews' });
 exports.createTour = factory.createOne(Tour);
 exports.updateTour = factory.updateOne(Tour);
 exports.deleteTour = factory.deleteOne(Tour);
 
+// Aggregation to get tour statistics
 exports.getTourStats = catchAsync(async (req, res, next) => {
   const stats = await Tour.aggregate([
     {
-      $match: { ratingsAverage: { $gte: 4.5 } }
+      $match: { ratingsAverage: { $gte: 4.5 } },
     },
     {
       $group: {
@@ -29,73 +90,70 @@ exports.getTourStats = catchAsync(async (req, res, next) => {
         avgRating: { $avg: '$ratingsAverage' },
         avgPrice: { $avg: '$price' },
         minPrice: { $min: '$price' },
-        maxPrice: { $max: '$price' }
-      }
+        maxPrice: { $max: '$price' },
+      },
     },
     {
-      $sort: { avgPrice: 1 }
-    }
-    // {
-    //   $match: { _id: { $ne: 'EASY' } }
-    // }
+      $sort: { avgPrice: 1 },
+    },
   ]);
 
   res.status(200).json({
     status: 'success',
     data: {
-      stats
-    }
+      stats,
+    },
   });
 });
 
+// Aggregation to get the monthly plan for tours
 exports.getMonthlyPlan = catchAsync(async (req, res, next) => {
-  const year = req.params.year * 1; // 2021
+  const year = req.params.year * 1; // Convert year to number
 
   const plan = await Tour.aggregate([
     {
-      $unwind: '$startDates'
+      $unwind: '$startDates',
     },
     {
       $match: {
         startDates: {
           $gte: new Date(`${year}-01-01`),
-          $lte: new Date(`${year}-12-31`)
-        }
-      }
+          $lte: new Date(`${year}-12-31`),
+        },
+      },
     },
     {
       $group: {
         _id: { $month: '$startDates' },
         numTourStarts: { $sum: 1 },
-        tours: { $push: '$name' }
-      }
+        tours: { $push: '$name' },
+      },
     },
     {
-      $addFields: { month: '$_id' }
+      $addFields: { month: '$_id' },
     },
     {
       $project: {
-        _id: 0
-      }
+        _id: 0,
+      },
     },
     {
-      $sort: { numTourStarts: -1 }
+      $sort: { numTourStarts: -1 },
     },
     {
-      $limit: 12
-    }
+      $limit: 12,
+    },
   ]);
 
   res.status(200).json({
     status: 'success',
     data: {
-      plan
-    }
+      plan,
+    },
   });
 });
 
-// /tours-within/:distance/center/:latlng/unit/:unit
-// /tours-within/233/center/34.111745,-118.113491/unit/mi
+// Find tours within a certain distance from a given location
 exports.getToursWithin = catchAsync(async (req, res, next) => {
   const { distance, latlng, unit } = req.params;
   const [lat, lng] = latlng.split(',');
@@ -103,27 +161,28 @@ exports.getToursWithin = catchAsync(async (req, res, next) => {
   const radius = unit === 'mi' ? distance / 3963.2 : distance / 6378.1;
 
   if (!lat || !lng) {
-    next(
+    return next(
       new AppError(
-        'Please provide latitutr and longitude in the format lat,lng.',
-        400
-      )
+        'Please provide latitude and longitude in the format lat,lng.',
+        400,
+      ),
     );
   }
 
   const tours = await Tour.find({
-    startLocation: { $geoWithin: { $centerSphere: [[lng, lat], radius] } }
+    startLocation: { $geoWithin: { $centerSphere: [[lng, lat], radius] } },
   });
 
   res.status(200).json({
     status: 'success',
     results: tours.length,
     data: {
-      data: tours
-    }
+      data: tours,
+    },
   });
 });
 
+// Calculate distances from a given location
 exports.getDistances = catchAsync(async (req, res, next) => {
   const { latlng, unit } = req.params;
   const [lat, lng] = latlng.split(',');
@@ -131,11 +190,11 @@ exports.getDistances = catchAsync(async (req, res, next) => {
   const multiplier = unit === 'mi' ? 0.000621371 : 0.001;
 
   if (!lat || !lng) {
-    next(
+    return next(
       new AppError(
-        'Please provide latitutr and longitude in the format lat,lng.',
-        400
-      )
+        'Please provide latitude and longitude in the format lat,lng.',
+        400,
+      ),
     );
   }
 
@@ -144,24 +203,24 @@ exports.getDistances = catchAsync(async (req, res, next) => {
       $geoNear: {
         near: {
           type: 'Point',
-          coordinates: [lng * 1, lat * 1]
+          coordinates: [lng * 1, lat * 1],
         },
         distanceField: 'distance',
-        distanceMultiplier: multiplier
-      }
+        distanceMultiplier: multiplier,
+      },
     },
     {
       $project: {
         distance: 1,
-        name: 1
-      }
-    }
+        name: 1,
+      },
+    },
   ]);
 
   res.status(200).json({
     status: 'success',
     data: {
-      data: distances
-    }
+      data: distances,
+    },
   });
 });
