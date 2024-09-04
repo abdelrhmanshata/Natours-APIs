@@ -27,6 +27,10 @@ This project is a RESTful API for the Natours application, a tour booking platfo
    Create a .env file in the root directory.
    Add the required environment variables (refer to .env.example).
 
+4. Start the server:
+   ```bash
+   npm start
+   ```
 ## Endpoints
 
 Here’s a brief overview of the main API endpoints:
